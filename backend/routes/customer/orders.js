@@ -1,0 +1,589 @@
+const express = require("express");
+const prisma = require("../../config/prisma");
+const authMiddleware = require("../../middleware/authMiddleware");
+const { body, validationResult } = require("express-validator");
+const {
+  sendOrderConfirmationEmail,
+  sendAdminNewOrderEmail,
+  sendLowStockAlertEmail,
+} = require("../../utils/orderEmails");
+const {
+  LOW_STOCK_THRESHOLD,
+  generateOrderNumber,
+  computePricingFromSchema,
+} = require("../../services/paymentPending");
+
+const router = express.Router();
+
+const requireCustomer = (req, res, next) => {
+  if (req.user?.type !== "customer") {
+    return res.status(403).json({ success: false, message: "Forbidden." });
+  }
+  next();
+};
+
+const validateBody = (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ success: false, errors: errors.array() });
+  }
+  return null;
+};
+
+router.post(
+  "/",
+  authMiddleware,
+  requireCustomer,
+  [
+    body("items")
+      .isArray({ min: 1 })
+      .withMessage("Items must be a non-empty array"),
+    body("items.*.productId")
+      .isString()
+      .trim()
+      .notEmpty()
+      .withMessage("Each item.productId must be a non-empty string"),
+    body("items.*.qty")
+      .isInt({ min: 1 })
+      .withMessage("Each item.qty must be an integer >= 1"),
+
+    body("address.fullName")
+      .isString()
+      .trim()
+      .notEmpty()
+      .withMessage("Full name is required"),
+    body("address.phone")
+      .isString()
+      .trim()
+      .notEmpty()
+      .withMessage("Phone is required"),
+    body("address.streetAddress")
+      .isString()
+      .trim()
+      .notEmpty()
+      .withMessage("Street address is required"),
+    body("address.city")
+      .isString()
+      .trim()
+      .notEmpty()
+      .withMessage("City is required"),
+
+    body("address.deliveryNote")
+      .optional()
+      .isString()
+      .withMessage("deliveryNote must be a string"),
+
+    body("addressId")
+      .optional({ nullable: true })
+      .isString()
+      .trim()
+      .notEmpty()
+      .withMessage("addressId must be a non-empty string"),
+  ],
+  async (req, res) => {
+    try {
+      const bodyError = validateBody(req, res);
+      if (bodyError) return;
+
+      const userId = req.user.id;
+      const { items, address, addressId } = req.body;
+
+      const productIds = items.map((i) => i.productId);
+
+      const products = await prisma.product.findMany({
+        where: {
+          id: { in: productIds },
+        },
+        select: {
+          id: true,
+          name: true,
+          metalType: true,
+          weightGrams: true,
+          makingCharge: true,
+          makingChargeType: true,
+          wastagePercent: true,
+          vatPercent: true,
+          isActive: true,
+          stock: true,
+        },
+      });
+
+      const productsById = new Map(products.map((p) => [p.id, p]));
+
+      for (const item of items) {
+        const p = productsById.get(item.productId);
+        if (!p || !p.isActive) {
+          return res.status(400).json({
+            success: false,
+            message: `Item failed: productId=${item.productId} is invalid or inactive`,
+          });
+        }
+
+        if (Number(p.stock ?? 0) < item.qty) {
+          return res.status(400).json({
+            success: false,
+            message: `Insufficient stock for "${p.name}". Available: ${p.stock}`,
+          });
+        }
+      }
+
+      const metalTypes = Array.from(new Set(products.map((p) => p.metalType)));
+
+      // Latest per metal type
+      const latestRates = await Promise.all(
+        metalTypes.map(async (mt) => {
+          const rate = await prisma.metalRate.findFirst({
+            where: { metalType: mt },
+            orderBy: { createdAt: "desc" },
+            select: { metalType: true, ratePerGram: true },
+          });
+          return rate;
+        }),
+      );
+
+      const ratesByType = new Map(
+        latestRates
+          .filter(Boolean)
+          .map((r) => [r.metalType, Number(r.ratePerGram)]),
+      );
+
+      // If any rate missing, fail
+      for (const mt of metalTypes) {
+        if (!ratesByType.has(mt)) {
+          return res.status(500).json({
+            success: false,
+            message: `Metal rate missing for ${mt}`,
+          });
+        }
+      }
+
+      const orderItemsComputed = items.map((item) => {
+        const product = productsById.get(item.productId);
+        const ratePerGram = ratesByType.get(product.metalType);
+
+        const breakdown = computePricingFromSchema({
+          product,
+          ratePerGram,
+        });
+
+        const qty = item.qty;
+        const totalPrice = Math.round(breakdown.totalAmount * qty * 100) / 100;
+
+        return {
+          productId: product.id,
+          productName: product.name,
+          metalType: product.metalType,
+          weightGrams: Number(product.weightGrams),
+          metalRate: ratePerGram,
+          makingCharge: breakdown.makingCharge,
+          wastageCharge: breakdown.wastageCharge,
+          vatPercent: Number(product.vatPercent ?? 13),
+          vatAmountPerUnit: breakdown.vatAmount,
+          unitPrice: breakdown.totalAmount,
+          quantity: qty,
+          totalPrice,
+          metalCost: breakdown.metalCost,
+        };
+      });
+
+      const totalAmount =
+        Math.round(
+          orderItemsComputed.reduce((sum, it) => sum + it.totalPrice, 0) * 100,
+        ) / 100;
+
+      const metalRateSnapshot = Object.fromEntries(
+        latestRates
+          .filter(Boolean)
+          .map((r) => [r.metalType, Number(r.ratePerGram)]),
+      );
+
+      const orderNumber = await generateOrderNumber({ prismaClient: prisma });
+
+      // Determine address to use: reuse existing or create new
+      let resolvedAddressId = null;
+
+      if (addressId) {
+        // Ownership check for provided addressId
+        await prisma.$transaction(async (tx) => {
+          const addr = await tx.address.findFirst({
+            where: { id: addressId, userId },
+            select: { id: true },
+          });
+          if (!addr) {
+            const err = new Error("Forbidden.");
+            err.status = 403;
+            err.expose = true;
+            throw err;
+          }
+          resolvedAddressId = addr.id;
+        });
+      } else {
+        // Create a new address from the manual fields
+        const addressRow = {
+          userId,
+          fullName: address.fullName,
+          phone: address.phone,
+          street: address.streetAddress,
+          city: address.city,
+          country: "Nepal",
+          isDefault: false,
+        };
+
+        const createdAddr = await prisma.address.create({ data: addressRow });
+        resolvedAddressId = createdAddr.id;
+      }
+
+      // Prisma default interactive transaction timeout can be too low for this request.
+      // Split the write work into smaller transactions to avoid 'Transaction already closed'.
+
+      // 1) Clear cart, decrement stock (address already resolved above)
+      let lowStockEmailQueue = [];
+      await prisma.$transaction(async (tx) => {
+        // Clear cart first (order success leaves no cart residue)
+        await tx.cartItem.deleteMany({
+          where: { cart: { userId } },
+        });
+
+        // Final stock enforcement + decrement inside the transaction.
+        // (Protects against race conditions / stale stock.)
+        for (const it of orderItemsComputed) {
+          const p = await tx.product.findUnique({
+            where: { id: it.productId },
+            select: {
+              stock: true,
+              isActive: true,
+              isLowStockAlertSent: true,
+              name: true,
+            },
+          });
+
+          if (!p || !p.isActive) {
+            throw Object.assign(new Error("Product invalid/inactive"), {
+              status: 400,
+              expose: true,
+            });
+          }
+
+          if (Number(p.stock ?? 0) < it.quantity) {
+            throw Object.assign(new Error("Insufficient stock"), {
+              status: 400,
+              expose: true,
+            });
+          }
+
+          const newStock = Number(p.stock ?? 0) - it.quantity;
+          const shouldAlert =
+            newStock <= LOW_STOCK_THRESHOLD && p.isLowStockAlertSent === false;
+
+          // Decrement
+          await tx.product.update({
+            where: { id: it.productId },
+            data: { stock: { decrement: it.quantity } },
+          });
+
+          // Deduping: mark as sent in the same transaction to avoid races.
+          if (shouldAlert) {
+            await tx.product.update({
+              where: { id: it.productId },
+              data: { isLowStockAlertSent: true },
+            });
+
+            lowStockEmailQueue.push({
+              id: it.productId,
+              name: p.name,
+              stock: newStock,
+            });
+          }
+        }
+      });
+
+      // 2) Create order + orderItems in a new transaction (faster)
+      const createdFinal = await prisma.$transaction(async (tx) => {
+        const order = await tx.order.create({
+          data: {
+            orderNumber,
+            userId,
+            addressId: resolvedAddressId,
+            status: "PENDING",
+            paymentStatus: "UNPAID",
+            paymentMethod: "COD",
+            paymentRef: null,
+            metalCost:
+              Math.round(
+                orderItemsComputed.reduce(
+                  (s, it) => s + it.metalCost * it.quantity,
+                  0,
+                ) * 100,
+              ) / 100,
+            makingCharge:
+              Math.round(
+                orderItemsComputed.reduce(
+                  (s, it) => s + it.makingCharge * it.quantity,
+                  0,
+                ) * 100,
+              ) / 100,
+            wastageCharge:
+              Math.round(
+                orderItemsComputed.reduce(
+                  (s, it) => s + it.wastageCharge * it.quantity,
+                  0,
+                ) * 100,
+              ) / 100,
+            vatAmount:
+              Math.round(
+                orderItemsComputed.reduce(
+                  (s, it) => s + it.vatAmountPerUnit * it.quantity,
+                  0,
+                ) * 100,
+              ) / 100,
+            totalAmount,
+            metalRateSnapshot,
+            notes: address.deliveryNote || null,
+          },
+        });
+
+        await tx.orderItem.createMany({
+          data: orderItemsComputed.map((it) => ({
+            orderId: order.id,
+            productId: it.productId,
+            productName: it.productName,
+            metalType: it.metalType,
+            weightGrams: it.weightGrams,
+            metalRate: it.metalRate,
+            makingCharge: it.makingCharge,
+            wastageCharge: it.wastageCharge,
+            vatPercent: it.vatPercent,
+            unitPrice: it.unitPrice,
+            quantity: it.quantity,
+            totalPrice: it.totalPrice,
+          })),
+        });
+
+        return order;
+      });
+
+      // Fire-and-forget emails (must not block response)
+
+      // Low stock alert emails (triggered after stock-decrement transaction commits)
+      try {
+        for (const p of lowStockEmailQueue) {
+          // fire-and-forget per requirement
+          try {
+            sendLowStockAlertEmail(p, {
+              adminEditUrl: `https://example.com/admin/products/${p.id}`,
+            });
+          } catch (e) {
+            console.error("sendLowStockAlertEmail call failed:", e);
+          }
+        }
+      } catch (e) {
+        console.error("Low stock email queue handling failed:", e);
+      }
+
+      try {
+        const customer = await prisma.user.findUnique({
+          where: { id: userId },
+          select: { id: true, email: true, firstName: true, phone: true },
+        });
+
+        const orderForEmail = {
+          ...createdFinal,
+          items: orderItemsComputed.map((it) => ({
+            productId: it.productId,
+            productName: it.productName,
+            metalType: it.metalType,
+            weightGrams: it.weightGrams,
+            unitPrice: it.unitPrice,
+            quantity: it.quantity,
+            totalPrice: it.totalPrice,
+          })),
+        };
+
+        // Wrap in try/catch regardless; email functions themselves also catch.
+        try {
+          sendOrderConfirmationEmail(orderForEmail, customer);
+        } catch (e) {
+          console.error("Order confirmation email call failed:", e);
+        }
+
+        try {
+          sendAdminNewOrderEmail(orderForEmail, customer);
+        } catch (e) {
+          console.error("Admin new order email call failed:", e);
+        }
+      } catch (e) {
+        console.error("Order email prep failed:", e);
+      }
+
+      // Ensure consistent response payload
+      const createdOrder = createdFinal;
+
+      return res.status(201).json({
+        success: true,
+        data: {
+          orderNumber: createdOrder.orderNumber,
+          id: createdOrder.id,
+          totalAmount: createdOrder.totalAmount,
+          status: createdOrder.status,
+        },
+      });
+    } catch (error) {
+      console.error("Create order error:", error);
+      const status = error?.status || 500;
+      const message = error?.expose ? error.message : "Server error";
+      return res.status(status).json({ success: false, message });
+    }
+  },
+);
+
+router.get("/", authMiddleware, requireCustomer, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const page = req.query.page ? Number(req.query.page) : 1;
+    const pageSize = req.query.pageSize ? Number(req.query.pageSize) : 50;
+
+    const take = Number.isFinite(pageSize) ? Math.min(pageSize, 50) : 50;
+    const skip = Math.max(0, (Number.isFinite(page) ? page - 1 : 0) * take);
+
+    const orders = await prisma.order.findMany({
+      where: {
+        userId,
+        NOT: {
+          AND: [
+            { paymentMethod: { in: ["ESEWA", "KHALTI"] } },
+            { paymentStatus: { not: "PAID" } },
+          ],
+        },
+      },
+      orderBy: { createdAt: "desc" },
+      take,
+      skip,
+      include: {
+        items: {
+          select: {
+            productName: true,
+            metalType: true,
+            weightGrams: true,
+            quantity: true,
+            unitPrice: true,
+            product: {
+              select: {
+                images: {
+                  orderBy: [{ isPrimary: "desc" }, { sortOrder: "asc" }],
+                  take: 1,
+                  select: { url: true },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    return res.json({
+      success: true,
+      data: orders.map((o) => ({
+        id: o.id,
+        orderNumber: o.orderNumber,
+        status: o.status,
+        paymentStatus: o.paymentStatus,
+        paymentMethod: o.paymentMethod,
+        totalAmount: o.totalAmount,
+        createdAt: o.createdAt,
+        items: o.items.map((it) => ({
+          productName: it.productName,
+          metalType: it.metalType,
+          weightGrams: it.weightGrams,
+          qty: it.quantity,
+          price: it.unitPrice,
+          imageUrl: it.product?.images?.[0]?.url ?? null,
+        })),
+      })),
+    });
+  } catch (error) {
+    console.error("List orders error:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+router.get("/:id", authMiddleware, requireCustomer, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { id } = req.params;
+
+    const order = await prisma.order.findFirst({
+      where: {
+        id,
+        userId,
+        NOT: {
+          AND: [
+            { paymentMethod: { in: ["ESEWA", "KHALTI"] } },
+            { paymentStatus: { not: "PAID" } },
+          ],
+        },
+      },
+      include: {
+        address: true,
+        items: {
+          select: {
+            productName: true,
+            metalType: true,
+            weightGrams: true,
+            quantity: true,
+            unitPrice: true,
+            product: {
+              select: {
+                images: {
+                  orderBy: [{ isPrimary: "desc" }, { sortOrder: "asc" }],
+                  take: 1,
+                  select: { url: true },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!order) {
+      // Must 404/403 if order doesn't belong to the requesting user.
+      return res.status(403).json({ success: false, message: "Forbidden." });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        id: order.id,
+        orderNumber: order.orderNumber,
+        status: order.status,
+        paymentStatus: order.paymentStatus,
+        paymentMethod: order.paymentMethod,
+        totalAmount: order.totalAmount,
+        createdAt: order.createdAt,
+        address: order.address
+          ? {
+              id: order.address.id,
+              fullName: order.address.fullName,
+              phone: order.address.phone,
+              streetAddress: order.address.street,
+              city: order.address.city,
+              deliveryNote: order.notes,
+            }
+          : null,
+        items: order.items.map((it) => ({
+          productName: it.productName,
+          metalType: it.metalType,
+          weightGrams: it.weightGrams,
+          qty: it.quantity,
+          price: it.unitPrice,
+          imageUrl: it.product?.images?.[0]?.url ?? null,
+        })),
+      },
+    });
+  } catch (error) {
+    console.error("Get order error:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+module.exports = router;
