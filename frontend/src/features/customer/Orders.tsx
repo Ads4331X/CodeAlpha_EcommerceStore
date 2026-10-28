@@ -316,7 +316,7 @@ export default function Orders() {
                               />
                             ) : it.productId ? (
                               <img
-                                src={it.productImageUrl || (it.productId ? `/uploads/products-image/${it.productId}.jpg` : undefined)}
+                                src={`/uploads/products-image/${it.productId}.jpg`}
                                 alt={it.name}
                                 className="w-full h-full object-cover"
                                 onError={(e) => {
