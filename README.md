@@ -353,6 +353,11 @@ finalPrice = subtotal + vatAmt
 
 Current metal rates are fetched from the `MetalRate` table (managed by admin).
 
+## Live Demo
+
+- **Frontend**: [https://codealpha-ecommerce-store-zeta.vercel.app/](https://codealpha-ecommerce-store-zeta.vercel.app/)
+- **Backend API**: [https://codealpha-ecommerce-api.vercel.app/](https://codealpha-ecommerce-api.vercel.app/)
+
 ## Deployment
 
 ### Backend (Vercel)
